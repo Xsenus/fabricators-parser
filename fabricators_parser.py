@@ -35,7 +35,7 @@ from sqlalchemy.dialects import postgresql
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 SCHEMA_VERSION = 1
 SCHEMA = "registry_fabricators"
 BASE = "https://fabricators.ru"
@@ -112,6 +112,12 @@ def external_site(url):
     return urlunsplit((p.scheme, p.netloc, p.path, query, ""))
 
 
+def external_sites(url):
+    """Return every explicit web address from a possibly combined source href."""
+    parts = re.split(r"\s*,\s*(?=https?://)", url or "", flags=re.I)
+    return [site for part in parts if (site := external_site(part))]
+
+
 def kind_of(url):
     path = urlsplit(url).path
     for prefix, kind in (("/proizvoditel/", "company"), ("/produkt/", "product_type"),
@@ -156,6 +162,13 @@ def normalize_contact(kind, value):
     if len(number) == 10:
         number = "7" + number
     return "+" + number if 11 <= len(number) <= 15 else None
+
+
+def phone_parts(value):
+    """Split source text that contains two or more displayed phone numbers."""
+    value = re.sub(r"\s+", " ", value or "").strip()
+    parts = re.split(r"\s*[,;|]\s*|(?<=\d)\s+(?=(?:\+?\d{1,3}\s*)?\(\d{2,5}\))", value)
+    return [part.strip() for part in parts if len(re.sub(r"\D", "", part)) >= 7]
 
 
 @dataclasses.dataclass
@@ -248,6 +261,14 @@ contacts = sa.Table("contacts", M, col("id", U, primary_key=True),
     col("first_seen_at", TS, nullable=False), col("last_seen_at", TS, nullable=False),
     col("is_current", sa.Boolean, nullable=False, default=True),
     sa.UniqueConstraint("company_id", "contact_type", "normalized_value"))
+company_sites = sa.Table("company_sites", M, col("id", U, primary_key=True),
+    col("company_id", U, sa.ForeignKey(companies.c.id), nullable=False, index=True),
+    col("site_url", sa.Text, nullable=False), col("domain", sa.Text), col("label", sa.Text),
+    col("source_url", sa.Text, nullable=False), col("validation_status", sa.Text, nullable=False),
+    col("is_primary", sa.Boolean, nullable=False, default=False),
+    col("first_seen_at", TS, nullable=False), col("last_seen_at", TS, nullable=False),
+    col("is_current", sa.Boolean, nullable=False, default=True),
+    sa.UniqueConstraint("company_id", "site_url"))
 snapshots = sa.Table("page_snapshots", M, col("id", U, primary_key=True),
     col("source_url", sa.Text, nullable=False, index=True), col("kind", sa.Text, nullable=False),
     col("fetched_at", TS, nullable=False), col("content_hash", sa.String(64), nullable=False),
@@ -291,6 +312,13 @@ class Database:
         changes = {k: stmt.excluded[k] for k in values if k not in keys and k not in ("first_seen_at", "installed_at")}
         stmt = stmt.on_conflict_do_update(index_elements=keys, set_=changes) if update and changes else stmt.on_conflict_do_nothing(index_elements=keys)
         c.execute(stmt)
+
+    def upsert_unique(self, c, table, values, keys):
+        build = pg_insert if self.engine.dialect.name == "postgresql" else sqlite_insert
+        stmt = build(table).values(**values)
+        changes = {k: stmt.excluded[k] for k in values
+                   if k not in set(keys) | {"id", "first_seen_at", "installed_at"}}
+        c.execute(stmt.on_conflict_do_update(index_elements=list(keys), set_=changes))
 
     def issue(self, c, url, code, detail=""):
         self.upsert(c, issues, {"id": uid("issue", url + code + detail), "source_url": url,
@@ -348,10 +376,20 @@ class Database:
                     c.execute(contacts.update().where(contacts.c.company_id == ident,
                         contacts.c.contact_type == contact_kind).values(is_current=False))
             for item in record["contacts"]:
-                self.upsert(c, contacts, dict(id=uid("contact", str(ident) + item["kind"] + item["normalized"]),
+                self.upsert_unique(c, contacts, dict(id=uid("contact", str(ident) + item["kind"] + item["normalized"]),
                     company_id=ident, contact_type=item["kind"], raw_value=item["raw"], normalized_value=item["normalized"],
                     source_url=url, extraction_method=item["method"], validation_status="format_valid_unverified",
-                    first_seen_at=now(), last_seen_at=now(), is_current=True))
+                    first_seen_at=now(), last_seen_at=now(), is_current=True),
+                    ("company_id", "contact_type", "normalized_value"))
+            if "sites" in record["present"]:
+                c.execute(company_sites.update().where(company_sites.c.company_id == ident).values(is_current=False))
+                for pos, site_url in enumerate(record["metadata"].get("site_links", [])):
+                    self.upsert_unique(c, company_sites, dict(
+                        id=uid("company_site", str(ident) + site_url), company_id=ident,
+                        site_url=site_url, domain=urlsplit(site_url).hostname, label=None,
+                        source_url=url, validation_status="format_valid_unverified",
+                        is_primary=pos == 0, first_seen_at=now(), last_seen_at=now(), is_current=True),
+                        ("company_id", "site_url"))
             for item in record["products"]:
                 old = c.execute(sa.select(products.c.company_id).where(products.c.source_url == item["url"])).scalar_one_or_none()
                 if old and old != ident:
@@ -459,12 +497,22 @@ def collect_contacts(soup, kind, method="html"):
         return [], "missing"
     values = []
     for line in block.select(".line") or [block]:
-        anchors = line.select('a[href^="tel:"],a[href^="mailto:"]')
-        texts = [a["href"].split(":", 1)[1].split("?")[0] for a in anchors] or [text_of(line)]
-        for raw in texts:
-            normalized = normalize_contact(kind, raw)
-            if normalized:
-                values.append({"kind": kind, "raw": raw, "normalized": normalized, "method": method})
+        selector = 'a[href^="tel:"]' if kind == "phone" else 'a[href^="mailto:"]'
+        anchors = line.select(selector)
+        sources = [text_of(line)] if not anchors else []
+        for anchor in anchors:
+            visible = text_of(anchor)
+            href = anchor["href"].split(":", 1)[1].split("?")[0]
+            visible_parts = (phone_parts(visible) if kind == "phone" else
+                re.findall(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", visible))
+            sources.extend([visible] if any(normalize_contact(kind, x) for x in visible_parts) else [href])
+        for source in sources:
+            candidates = phone_parts(source) if kind == "phone" else re.findall(
+                r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", source)
+            for raw in candidates:
+                normalized = normalize_contact(kind, raw)
+                if normalized:
+                    values.append({"kind": kind, "raw": raw, "normalized": normalized, "method": method})
     dedupe = {x["normalized"]: x for x in values}
     if dedupe:
         status = "partial" if masked(text_of(block)) else ("revealed" if method == "browser_click" else "public")
@@ -553,11 +601,13 @@ def parse_html(html, url, kind=None, owner_hint=None):
             result["employee_count"] = int(n) if n is not None else None
         if field(soup, "field_ustavnoy_kapital"):
             result["capital"] = number_value(content_text(field(soup, "field_ustavnoy_kapital")))
-        site = soup.select_one(".field_site a[href]")
-        record["metadata"]["site_links"] = list(dict.fromkeys(
-            link for a in soup.select(".field_site a[href]") if (link := external_site(a["href"]))))
-        if site:
-            result["site_url"] = external_site(site["href"])
+        site_field = field(soup, "field_site")
+        site_links = [link for a in soup.select(".field_site a[href]") for link in external_sites(a["href"])]
+        record["metadata"]["site_links"] = list(dict.fromkeys(site_links))
+        if site_field is not None:
+            record["present"].append("sites")
+        if record["metadata"]["site_links"]:
+            result["site_url"] = record["metadata"]["site_links"][0]
             result["domain"] = urlsplit(result["site_url"]).hostname if result["site_url"] else None
         for contact_kind in ("phone", "email"):
             values, status = collect_contacts(soup, contact_kind)
@@ -1021,7 +1071,7 @@ def crawl(db, cfg, limit):
 
 PUBLIC_TABLES = [companies, enterprise_nodes, product_types, goods_categories, company_enterprises,
     company_product_types, enterprise_edges, product_type_edges, products, product_type_links,
-    product_category_links, contacts]
+    product_category_links, contacts, company_sites]
 EXPORT_TABLES = PUBLIC_TABLES + [snapshots, issues]
 EXPORT_TABLES = [t for t in M.sorted_tables if t in EXPORT_TABLES]
 

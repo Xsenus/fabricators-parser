@@ -73,6 +73,20 @@ class ExtractionTests(unittest.TestCase):
         self.assertIsNone(f.normalize_contact('phone', '+7910058X-XX'))
         self.assertEqual(f.normalize_contact('phone', '8 (800) 123-45-67 доб. 12'), '+78001234567')
 
+    def test_all_phones_from_one_visible_link(self):
+        s = f.BeautifulSoup(
+            '<div class="field_phone"><div class="line">'
+            '<a href="tel:849984180288">8(499)841-80-28 8(499)714-70-97</a>'
+            '</div></div>', 'html.parser')
+        vals, status = f.collect_contacts(s, 'phone')
+        self.assertEqual(status, 'public')
+        self.assertEqual({x['normalized'] for x in vals}, {'+74998418028', '+74997147097'})
+
+    def test_combined_site_href_is_split(self):
+        self.assertEqual(
+            f.external_sites('https://example.org, https://vk.com/example?utm_source=test'),
+            ['https://example.org', 'https://vk.com/example'])
+
     def test_inn_checksum_and_invalid_input(self):
         self.assertTrue(f.inn_valid('5256083213'))
         self.assertFalse(f.inn_valid('5256083214'))
@@ -118,6 +132,7 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(before['company_product_types'], 9)
         self.assertEqual(before['product_category_links'], 3)
         self.assertEqual(before['product_type_links'], 0)
+        self.assertEqual(before['company_sites'], 1)
         with self.db.engine.connect() as c:
             p = c.execute(sa.select(f.products)).mappings().one()
             self.assertEqual(p['company_id'], f.uid('companies', COMPANY))
