@@ -1,0 +1,22 @@
+{
+  "database_env": "DATABASE_URL",
+  "access_reference": "",
+  "user_agent": "FabricatorsRegistryCollector/1.0",
+  "min_delay": 7.0,
+  "max_delay": 13.0,
+  "timeout": 35.0,
+  "max_attempts": 4,
+  "max_bytes": 8000000,
+  "max_requests": 5000,
+  "data_dir": "/var/lib/fabricators/data",
+  "browser_contacts": true,
+  "browser_state_env": "FABRICATORS_BROWSER_STATE",
+  "contact_wait_ms": 30000,
+  "seeds": [
+    "https://fabricators.ru/zavody",
+    "https://fabricators.ru/sitemap/produkt",
+    "https://fabricators.ru/sitemap.xml"
+  ],
+  "phone_click_selector": ".field_phone a.view-phone",
+  "email_click_selector": ".field_email a.view-email"
+}

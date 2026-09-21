@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+set -a
+. /etc/fabricators/collector.env
+set +a
+exec /opt/fabricators/.venv/bin/python /opt/fabricators/fabricators_parser.py --config /etc/fabricators/config.json "$@"

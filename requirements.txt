@@ -1,0 +1,6 @@
+beautifulsoup4==4.15.0
+httpx==0.28.1
+SQLAlchemy==2.0.54
+psycopg[binary]==3.3.6
+protego==0.6.2
+playwright==1.63.0

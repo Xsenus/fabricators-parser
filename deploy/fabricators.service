@@ -1,0 +1,25 @@
+[Unit]
+Description=Fabricators shared registry collector
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=fabricators
+Group=fabricators
+WorkingDirectory=/opt/fabricators
+EnvironmentFile=/etc/fabricators/collector.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/fabricators/.venv/bin/python /opt/fabricators/fabricators_parser.py --config /etc/fabricators/config.json crawl --max-pages 1000
+Restart=no
+TimeoutStopSec=90
+KillSignal=SIGTERM
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/fabricators
+
+[Install]
+WantedBy=multi-user.target
